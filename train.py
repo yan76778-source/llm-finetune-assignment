@@ -102,11 +102,11 @@ def main(args):
 
 # --- 4. 命令行入口 ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Finetune Qwen2-1.5B on GSM8K")
+    parser = argparse.ArgumentParser(description="Finetune Qwen1.5-1.8B on GSM8K")
     
     parser.add_argument("--mode", type=str, required=True, choices=["direct", "cot"],
                         help="Finetuning mode: 'direct' or 'cot'")
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2-1.5-1.8B-Chat",
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen1.5-1.8B-Chat",
                         help="Base model ID from Hugging Face")
     parser.add_argument("--output_dir", type=str, default="./results",
                         help="Directory for training outputs (logs, checkpoints)")

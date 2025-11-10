@@ -1,34 +1,53 @@
+# file: utils.py
 import re
+
 def parse_final_answer(text):
-    """从CoT或直接输出中解析出 \boxed{} 或最后的数字"""
+    """从 CoT 或直接输出中解析出 \boxed{} 或最后的数字/文本"""
+    if text is None:
+        return None
     # 优先匹配 \boxed{}
-    match = re.search(r"\\boxed\{([\d\.,]+)\}", text)
+    match = re.search(r"\\boxed\{([^\}]+)\}", text)
     if match:
-        return match.group(1).replace(",", "")
-    
-    # ... (其他解析逻辑)
-    matches = re.findall(r"([\d\.,]+)", text)
+        return match.group(1).strip()
+
+    # 如果没有 \boxed，尝试匹配“答案：...”后的文本
+    m = re.search(r"答案[:：]\s*(.+)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 最后尝试抓最后的数字/token
+    matches = re.findall(r"([\d\.\,]+)", text)
     if matches:
         return matches[-1].replace(",", "")
+    # 否则返回原文本的最后一行（作为兜底）
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if lines:
+        return lines[-1]
     return None
 
 def create_chat_messages(example, mode="cot"):
     """
-    根据模式(direct/cot)创建 ChatML 格式的训练样本
+    把 gsm8k 的实例转换为用于 SFTTrainer 的单字段 "text"
+    返回字典 {'text': '<prompt and response text>'}
     """
-    question = "Question: " + example['question']
-    answer_text = example['answer']
-    
+    # gsm8k fields: 'question', 'answer' (answer may contain solution steps for cot)
+    question = example.get("question") or example.get("Problem") or ""
+    answer_text = example.get("answer") or example.get("Answer") or ""
+
+    # Build prompt -> we design a simple chat-like prompt.
     if mode == "direct":
-        final_answer = parse_final_answer(answer_text)
-        if final_answer is None:
-            return None # 如果无法解析答案，跳过此样本
-        assistant_content = final_answer
+        # For direct, we want the assistant to output just the final answer.
+        final = parse_final_answer(answer_text)
+        if final is None:
+            # skip if cannot parse final answer (trainer will filter None)
+            return None
+        prompt = f"User: {question}\nAssistant:"
+        # We set text to: prompt + final answer (so trainer learns mapping)
+        full_text = prompt + " " + final
     else:
-        assistant_content = answer_text
-        
-    messages = [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": assistant_content}
-    ]
-    return {"messages": messages} # <--- 注意, 为了 'map' 函数，返回一个字典
+        # For CoT, include the full answer text (which contains reasoning and final)
+        prompt = f"User: {question}\nAssistant:"
+        # sometimes answer_text already contains steps; ensure spacing
+        full_text = prompt + " " + answer_text
+
+    return {"text": full_text}

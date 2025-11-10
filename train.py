@@ -1,38 +1,46 @@
 # file: train.py
-import torch
 import os
-import argparse  # <-- 专业加分项：使用命令行参数
-from datasets import load_dataset, Dataset
-from transformers import (
-    AutoModelForCausalLM, AutoTokenizer,
-    BitsAndBytesConfig, TrainingArguments
-)
+import argparse
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from peft import LoraConfig
 from trl import SFTTrainer
 
-# 导入我们自己的辅助函数
+# utils functions from utils.py (we assume in same folder)
 from utils import parse_final_answer, create_chat_messages
 
-# --- 1. QLoRA 和模型加载配置 ---
-def load_model_and_tokenizer(model_id):
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+def load_model_and_tokenizer(model_id, use_8bit=True):
+    """
+    Try to load model in 8-bit if possible. If bitsandbytes isn't available or fails,
+    fallback to full precision (or automatic dtype).
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+
+    try:
+        if use_8bit:
+            # 8-bit load (bitsandbytes must be installed and GPU supported)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="auto",
+                load_in_8bit=True,
+                trust_remote_code=True,
+            )
+        else:
+            raise RuntimeError("skip 8bit")
+    except Exception as e:
+        print(">>>> Warning: failed to load in 8-bit or bitsandbytes not available:", e)
+        print(">>>> Falling back to load without 8-bit (may use more VRAM).")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map="auto",
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True,
+        )
     return model, tokenizer
 
-# --- 2. PEFT (LoRA) 配置 ---
 def get_peft_config():
     return LoraConfig(
         r=16,
@@ -45,65 +53,63 @@ def get_peft_config():
         task_type="CAUSAL_LM",
     )
 
-# --- 3. 训练器主函数 ---
 def main(args):
-    """主训练函数"""
-    
-    print(f"--- 1. 加载模型和Tokenizer: {args.model_id} ---")
-    model, tokenizer = load_model_and_tokenizer(args.model_id)
+    print(f"--- 1. 加载模型和Tokenizer: {args.model_id} (try 8-bit: {not args.no_8bit}) ---")
+    model, tokenizer = load_model_and_tokenizer(args.model_id, use_8bit=not args.no_8bit)
 
     print(f"--- 2. 加载和处理数据集 (模式: {args.mode}) ---")
     dataset = load_dataset("gsm8k", "main", split="train")
-    
-    # 使用 .map() 高效处理
-    processed_dataset = dataset.map(
-        lambda ex: create_chat_messages(ex, mode=args.mode),
-        batched=False, # 一次处理一个样本
-        remove_columns=dataset.column_names # 删除旧列
-    ).filter(lambda ex: ex["messages"] is not None) # 过滤掉解析失败的样本
 
-    print(f"成功处理 {len(processed_dataset)} 条样本。")
-    
+    # map to training examples using utils.create_chat_messages
+    def map_fn(ex):
+        return create_chat_messages(ex, mode=args.mode)
+
+    processed = dataset.map(map_fn, remove_columns=dataset.column_names)
+    # filter out any None
+    processed = processed.filter(lambda ex: ex is not None and "text" in ex and ex["text"] is not None)
+
+    print(f"成功处理 {len(processed)} 条样本。")
+
     peft_config = get_peft_config()
-    
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        optim="paged_adamw_8bit",
-        learning_rate=2e-4,
-        lr_scheduler_type="cosine",
-        num_train_epochs=1,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        optim="paged_adamw_8bit" if not args.no_8bit else "adamw_torch",
+        learning_rate=args.lr,
+        num_train_epochs=args.epochs,
         save_strategy="epoch",
-        logging_steps=25,
+        logging_steps=50,
         report_to="none",
-        fp16=False,
-        bf16=True,
-        max_seq_length=1024,
-        packing=True,
+        fp16=not args.no_bf16 and torch.cuda.is_available(),  # keep defaults
+        bf16=args.bf16 and torch.cuda.is_available(),
+        # trainer-specific, but keep max_seq_length for tokenization packing
+        max_seq_length=args.max_seq_length,
     )
 
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=processed_dataset,
+        train_dataset=processed,
         peft_config=peft_config,
-        dataset_text_field="messages",
-        max_seq_length=1024,
+        dataset_text_field="text",  # our utils return "text" field
+        max_seq_length=args.max_seq_length,
         args=training_args,
     )
-    
+
     print("--- 4. 开始训练 ---")
     trainer.train()
-    
+
     adapter_path = os.path.join(args.adapter_dir, f"gsm8k-{args.mode}")
     print(f"--- 5. 训练完成，保存适配器到 {adapter_path} ---")
+    os.makedirs(adapter_path, exist_ok=True)
     trainer.model.save_pretrained(adapter_path)
+    print("Saved adapter to", adapter_path)
 
-# --- 4. 命令行入口 ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Finetune Qwen1.5-1.8B on GSM8K")
-    
+    parser = argparse.ArgumentParser(description="Finetune Qwen-family on GSM8K (direct vs cot)")
+
     parser.add_argument("--mode", type=str, required=True, choices=["direct", "cot"],
                         help="Finetuning mode: 'direct' or 'cot'")
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen1.5-1.8B-Chat",
@@ -112,6 +118,13 @@ if __name__ == "__main__":
                         help="Directory for training outputs (logs, checkpoints)")
     parser.add_argument("--adapter_dir", type=str, default="./adapters",
                         help="Directory to save the final LoRA adapters")
-    
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--no_8bit", action="store_true", help="Disable 8-bit loading (force full/FP16)")
+    parser.add_argument("--bf16", action="store_true", help="Use bf16 if available")
+    parser.add_argument("--no_bf16", action="store_true", help="Disable bf16")
     args = parser.parse_args()
     main(args)

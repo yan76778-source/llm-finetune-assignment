@@ -7,21 +7,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from peft import LoraConfig
 from trl import SFTTrainer
 
-# utils functions from utils.py (we assume in same folder)
 from utils import parse_final_answer, create_chat_messages
 
 def load_model_and_tokenizer(model_id, use_8bit=True):
-    """
-    Try to load model in 8-bit if possible. If bitsandbytes isn't available or fails,
-    fallback to full precision (or automatic dtype).
-    """
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     try:
         if use_8bit:
-            # 8-bit load (bitsandbytes must be installed and GPU supported)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 device_map="auto",
@@ -60,18 +54,17 @@ def main(args):
     print(f"--- 2. 加载和处理数据集 (模式: {args.mode}) ---")
     dataset = load_dataset("gsm8k", "main", split="train")
 
-    # map to training examples using utils.create_chat_messages
     def map_fn(ex):
         return create_chat_messages(ex, mode=args.mode)
 
     processed = dataset.map(map_fn, remove_columns=dataset.column_names)
-    # filter out any None
     processed = processed.filter(lambda ex: ex is not None and "text" in ex and ex["text"] is not None)
 
     print(f"成功处理 {len(processed)} 条样本。")
 
     peft_config = get_peft_config()
 
+    # NOTE: TrainingArguments does NOT accept max_seq_length, so we remove it here.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -82,10 +75,8 @@ def main(args):
         save_strategy="epoch",
         logging_steps=50,
         report_to="none",
-        fp16=not args.no_bf16 and torch.cuda.is_available(),  # keep defaults
+        fp16=(not args.no_bf16) and torch.cuda.is_available(),
         bf16=args.bf16 and torch.cuda.is_available(),
-        # trainer-specific, but keep max_seq_length for tokenization packing
-        max_seq_length=args.max_seq_length,
     )
 
     trainer = SFTTrainer(
@@ -93,8 +84,8 @@ def main(args):
         tokenizer=tokenizer,
         train_dataset=processed,
         peft_config=peft_config,
-        dataset_text_field="text",  # our utils return "text" field
-        max_seq_length=args.max_seq_length,
+        dataset_text_field="text",   # our utils returns "text"
+        max_seq_length=args.max_seq_length,  # pass here, not to TrainingArguments
         args=training_args,
     )
 
@@ -118,8 +109,8 @@ if __name__ == "__main__":
                         help="Directory for training outputs (logs, checkpoints)")
     parser.add_argument("--adapter_dir", type=str, default="./adapters",
                         help="Directory to save the final LoRA adapters")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max_seq_length", type=int, default=1024)
